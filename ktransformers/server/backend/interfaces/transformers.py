@@ -6,6 +6,7 @@ from transformers import (
     LlamaForCausalLM,
     GenerationConfig,
     StaticCache,
+    DynamicCache,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
 )
@@ -134,16 +135,18 @@ class TransformersInterface(BackendInterfaceBase):
         self.args = args
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-        self.model = AutoModelForCausalLM.from_pretrained(args.model_dir, device_map=args.device, use_safetensors=True)
+        # self.model = AutoModelForCausalLM.from_pretrained(args.model_dir, device_map=args.device, use_safetensors=True)
+        self.model = AutoModelForCausalLM.from_pretrained(args.model_dir, device_map="auto", use_safetensors=True)
         # logger.info(f"{args.model_name} loaded from {args.model_dir} to {args.device}")
 
-        self.cache = StaticCache(
-            config=self.model.config,
-            max_batch_size=args.batch_size,
-            max_cache_len=args.cache_lens,
-            device=args.device,
-            dtype=self.model.dtype,
-        )
+        # self.cache = StaticCache(
+        #     config=self.model.config,
+        #     max_batch_size=args.batch_size,
+        #     max_cache_len=args.cache_lens,
+        #     device=args.device,
+        #     dtype=self.model.dtype,
+        # )
+        self.cache = DynamicCache()
         # logger.info(f"StaticCache (length={args.cache_lens}) created at {args.device}, batch size:{args.batch_size}")
 
         self.streamer = TextStreamer(self.tokenizer)
