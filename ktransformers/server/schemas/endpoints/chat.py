@@ -76,3 +76,19 @@ class ChatCompletionChunk(ChatCompletionBase):
 
     def to_stream_reply(self):
         return f"data:{self.model_dump_json()}\n\n"
+
+class CachePrepCreate(BaseModel):
+    data_path: str
+    stride: int
+    fields: List[str]
+    force_prep: bool = False
+
+class DataQueryCreate(BaseModel):
+    data_path: str
+    data_ids: list[int]
+    stride: int = 4
+    query: str
+    user_format: str
+    use_turbo: bool = True
+    use_cache: bool = False
+    is_full_data: bool = False

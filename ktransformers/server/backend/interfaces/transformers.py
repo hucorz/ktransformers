@@ -15,10 +15,19 @@ from ktransformers.server.config.config import Config
 from ktransformers.server.schemas.base import ObjectID
 from ktransformers.server.utils.multi_timer import Profiler
 import torch
-import sys, os
+import sys, os, json
+from tqdm import tqdm
 from ..base import ThreadContext, BackendInterfaceBase
 from ktransformers.server.config.log import logger
 from ..args import ConfigArgs, default_args
+from ..utils.cache import _cache_prep, _sys_cache_prep
+from ..utils.utils import load_data
+from ..response import (
+    response_normal,
+    response_turbo_without_cache,
+    response_turbo_with_system_cache,
+    response_turbo_with_all_cache,
+)
 
 
 # This TextStreamer is a modified version from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/streamers.py
@@ -51,7 +60,9 @@ class TextStreamer:
 
         # Add the new token to the cache and decodes the entire thing.
         self.token_cache.append(value)
-        text = self.tokenizer.decode(self.token_cache, skip_special_tokens=True, **self.decode_kwargs)
+        text = self.tokenizer.decode(
+            self.token_cache, skip_special_tokens=True, **self.decode_kwargs
+        )
 
         # After the symbol for a new line, we flush the cache.
         if text.endswith("\n"):
@@ -72,7 +83,9 @@ class TextStreamer:
         """Flushes any remaining cache and prints a newline to stdout."""
         # Flush the cache, if it exists
         if len(self.token_cache) > 0:
-            text = self.tokenizer.decode(self.token_cache, skip_special_tokens=True, **self.decode_kwargs)
+            text = self.tokenizer.decode(
+                self.token_cache, skip_special_tokens=True, **self.decode_kwargs
+            )
             printable_text = text[self.print_len :]
             self.reset()
         else:
@@ -136,7 +149,9 @@ class TransformersInterface(BackendInterfaceBase):
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
         # self.model = AutoModelForCausalLM.from_pretrained(args.model_dir, device_map=args.device, use_safetensors=True)
-        self.model = AutoModelForCausalLM.from_pretrained(args.model_dir, device_map="auto", use_safetensors=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir, device_map="auto", use_safetensors=True
+        )
         # logger.info(f"{args.model_name} loaded from {args.model_dir} to {args.device}")
 
         # self.cache = StaticCache(
@@ -150,6 +165,7 @@ class TransformersInterface(BackendInterfaceBase):
         # logger.info(f"StaticCache (length={args.cache_lens}) created at {args.device}, batch size:{args.batch_size}")
 
         self.streamer = TextStreamer(self.tokenizer)
+        self._init()
 
     @property
     def current_ids(self):
@@ -182,17 +198,19 @@ class TransformersInterface(BackendInterfaceBase):
         #     input_ids = self.tokenizer.apply_chat_template(
         #         new_messages, return_tensors="pt", add_generation_prompt=True
         #     ).to(self.args.device)
-        input_ids = self.tokenizer.apply_chat_template(new_messages,return_tensors='pt',add_generation_prompt=True).to(self.args.device)
+        input_ids = self.tokenizer.apply_chat_template(
+            new_messages, return_tensors="pt", add_generation_prompt=True
+        ).to(self.args.device)
         if (self.last_request_id is not None) and self.last_request_id == thread_id:
-            x = self.generated_ids[:,:self.seq_length]
-            y = input_ids[:,:self.seq_length]
+            x = self.generated_ids[:, : self.seq_length]
+            y = input_ids[:, : self.seq_length]
             # We can only hope that the input_ids are the same
-            unequal_mask = torch.ne(x,y)
+            unequal_mask = torch.ne(x, y)
             unequal_positions = torch.nonzero(unequal_mask)
             num_unequal_elements = unequal_mask.sum().item()
-            logger.warning(f'num_unequal_elements: {num_unequal_elements}') 
+            logger.warning(f"num_unequal_elements: {num_unequal_elements}")
 
-            input_ids = input_ids[:,self.seq_length:]
+            input_ids = input_ids[:, self.seq_length :]
         logger.debug(f"get input ids of shape {input_ids.shape}")
         return input_ids
 
@@ -202,7 +220,7 @@ class TransformersInterface(BackendInterfaceBase):
         return self.streamer.put(new_tokens)
 
     def logits_to_token(self, logits: torch.Tensor):
-        logits = logits / self.args.temperature if self.args.temperature!=0 else logits
+        logits = logits / self.args.temperature if self.args.temperature != 0 else logits
 
         for token_idx in self.ever_generated_ids:
             if logits[token_idx] < 0:
@@ -246,7 +264,8 @@ class TransformersInterface(BackendInterfaceBase):
         logger.debug(f"input_ids: {input_ids.shape}")
 
         if is_new:
-            self.cache.reset()
+            # self.cache.reset()
+            self.cache = DynamicCache()
             self.ever_generated_ids.clear()
             former_seq_length = 0
             self.seq_length = input_ids_length
@@ -295,7 +314,9 @@ class TransformersInterface(BackendInterfaceBase):
     def generate(self):
         self.profiler.set_counter("decode", 0)
         for _ in range(1, self.args.max_new_tokens):
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_mem_efficient=False, enable_math=True
+            ):
                 next_token = self.decode_one_tokens()
                 self.profiler.inc("decode")
                 if next_token == self.tokenizer.eos_token_id:
@@ -322,35 +343,162 @@ class TransformersInterface(BackendInterfaceBase):
         if isinstance(local_messages, List):
             input_ids = self.format_and_tokenize_input_ids(thread_id, local_messages)
         elif isinstance(local_messages, str):
-            #local_messages = local_messages[0]['content']
+            # local_messages = local_messages[0]['content']
             input_ids = self.tokenize_prompt(local_messages)
-            #input_ids = torch.tensor([[6366]], device=input_ids.device)
+            # input_ids = torch.tensor([[6366]], device=input_ids.device)
         else:
             raise ValueError("local_messages should be List or str")
         if Config().user_force_think:
-            token_thinks = torch.tensor([self.tokenizer.encode("<think>\\n",add_special_tokens=False)],device=input_ids.device)
-            input_ids = torch.cat(
-                [input_ids, token_thinks], dim=1
+            token_thinks = torch.tensor(
+                [self.tokenizer.encode("<think>\\n", add_special_tokens=False)],
+                device=input_ids.device,
             )
+            input_ids = torch.cat([input_ids, token_thinks], dim=1)
 
         self.profiler.pause_timer("tokenize")
 
         self.profiler.create_and_start_timer("prefill")
         if Config().user_force_think:
             t = "<think>\n"
-            print(t,end="",flush=True)
+            print(t, end="", flush=True)
             yield t
         for t in self.prefill(input_ids, self.check_is_new(thread_id)):
             if t is not None:
-                print(t, end="",flush=True)
+                print(t, end="", flush=True)
                 yield t
         self.profiler.pause_timer("prefill")
 
         self.profiler.create_and_start_timer("decode")
         for t in self.generate():
             if t is not None:
-                print(t, end="",flush=True)
-                yield t 
+                print(t, end="", flush=True)
+                yield t
         print("")
         self.profiler.pause_timer("decode")
         self.report_last_time_performance()
+
+    def _init(self):
+        self.model_name = os.path.basename(self.args.model_dir)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.cache_dir = os.path.normpath(os.path.join(script_dir, f"../data/cache"))
+        self.cache_meta_path = os.path.join(self.cache_dir, f"meta.json")
+        # each model has its own cache dir
+        self.cache_dir = os.path.join(self.cache_dir, self.model_name)
+        with open(self.cache_meta_path, "r") as f:
+            self.meta = json.load(f)
+
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
+        if self.meta["cache"].get(self.model_name, None) is None:
+            self.meta["cache"][self.model_name] = {}
+
+        # load system cache
+        system_cache_path = os.path.join(self.cache_dir, "system_cache.pt")
+        if not os.path.exists(system_cache_path):
+            self.system_cache = _sys_cache_prep(self.model, self.tokenizer, system_cache_path)
+        else:
+            self.system_cache = torch.load(system_cache_path, weights_only=True)
+
+    def cache_prep(self, data_path: str, stride: int, fields: list[str], force_prep: bool = False):
+        file_name_base = os.path.splitext(os.path.basename(data_path))[0]
+
+        # meta info
+        if (not force_prep) and data_path in self.meta["cache"][self.model_name]:
+            logger.info(
+                f"cache already exists: {self.meta['cache'][self.model_name][data_path]}, skip"
+                " cache prep"
+            )
+            return
+
+        data_cache_dir = os.path.join(self.cache_dir, f"{file_name_base}")
+        os.makedirs(data_cache_dir, exist_ok=True)
+
+        _cache_prep(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            data_path=data_path,
+            fields=fields,
+            stride=stride,
+            cache_dir=data_cache_dir,
+            system_cache=self.system_cache,
+        )
+
+        self.meta["cache"][self.model_name][data_path] = {
+            "cache_dir": data_cache_dir,
+            "fields": fields,
+        }
+        with open(self.cache_meta_path, "w") as f:
+            json.dump(self.meta, f, indent=4)
+
+    def data_query(
+        self,
+        data_path: str,
+        data_ids: list[int],
+        stride: int,
+        query: str,
+        user_format: str,
+        use_turbo: bool = True,
+        use_cache: bool = False,
+        is_full_data: bool = False,
+    ):
+        data = load_data(data_path, self.meta["cache"][self.model_name][data_path]["fields"])
+        data = [data[i] for i in data_ids]
+
+        data_length = len(data_ids)
+        response = []
+
+        if not use_turbo:
+            logger.info("Using response_normal")
+            for st in tqdm(range(0, data_length, stride)):
+                ed = min(st + stride, data_length)
+                data_slice = data[st:ed]
+                res = response_normal(self.model, self.tokenizer, data_slice, query, user_format)
+                # print(res)
+                response.append(res)
+        elif not use_cache:
+            logger.info("Using response_turbo_without_cache")
+            for st in tqdm(range(0, data_length, stride)):
+                ed = min(st + stride, data_length)
+                data_slice = data[st:ed]
+                res = response_turbo_without_cache(
+                    self.model, self.tokenizer, data_slice, query, user_format
+                )
+                print(res)
+                response.append(res)
+        elif not is_full_data:
+            logger.info("Using response_turbo_with_system_cache")
+            for st in tqdm(range(0, data_length, stride)):
+                ed = min(st + stride, data_length)
+                data_slice = data[st:ed]
+                response.append(
+                    response_turbo_with_system_cache(
+                        self.model,
+                        self.tokenizer,
+                        data_slice,
+                        query,
+                        user_format,
+                        self.system_cache,
+                    )
+                )
+        elif is_full_data:
+            logger.info("Using response_turbo_with_all_cache")
+            for st in tqdm(range(0, data_length, stride)):
+                ed = min(st + stride, data_length)
+                data_slice = data[st:ed]
+                data_cache_path = os.path.join(
+                    self.meta["cache"][self.model_name][data_path]["cache_dir"],
+                    f"data_cache_stride{stride}_st{st}.pt",
+                )
+                data_cache = torch.load(data_cache_path, weights_only=True)
+                response.append(
+                    response_turbo_with_all_cache(
+                        self.model,
+                        self.tokenizer,
+                        query,
+                        user_format,
+                        self.system_cache,
+                        data_cache,
+                        data_cnt=len(data_slice),
+                    )
+                )
+        return response

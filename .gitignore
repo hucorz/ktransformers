@@ -25,3 +25,7 @@ test.txt
 book
 
 Qwen2-57B-A14B-Instruct/
+*.csv
+server*.py
+test*.py
+ktransformers/server/backend/data/
