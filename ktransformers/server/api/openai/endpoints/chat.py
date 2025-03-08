@@ -81,15 +81,7 @@ def data_query(request: Request, create: DataQueryCreate):
 
     try:
         response_list = interface.data_query(**create.dict())
-        response_list = [
-            re.search(r"\[\[## RESULT ##\]\](.*)\[\[## COMPLETE ##\]\]", m, re.DOTALL)
-            .group(1)
-            .strip()
-            for m in response_list
-        ]
-        response_list = fix_common_response_error(response_list, valid=True)
-        response_list = [json.loads(m) for m in response_list]
-        response_list = [item for sub in response_list for item in sub]
+        response_list = [parse_model_response(m) for m in response_list]
         return JSONResponse(status_code=200, content={"status": "ok", "result": response_list})
     except Exception as e:
         stack_info = traceback.format_exc()
@@ -97,10 +89,10 @@ def data_query(request: Request, create: DataQueryCreate):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-def fix_common_response_error(response_list: list, valid: bool = False):
+def fix_common_response_error(response_list: list):
     for idx, response in enumerate(response_list):
-        response = re.sub(r": False", r": false", response)
-        response = re.sub(r": True", r": true", response)
+        response = re.sub(r"False", r"false", response)
+        response = re.sub(r"True", r"true", response)
         response_list[idx] = response
         if valid:
             try:
@@ -109,3 +101,14 @@ def fix_common_response_error(response_list: list, valid: bool = False):
                 stack_info = traceback.format_exc()
                 logger.error(f"\nResponse{idx}: {response}\n{stack_info}")
     return response_list
+
+
+def parse_model_response(output: str) -> dict:
+    result = {}
+    pattern = re.compile(r"\[\[## (.*?) ##\]]\n(.*?)\n", re.DOTALL)
+
+    for match in pattern.finditer(output):
+        key, value = match.groups()
+        result[key] = value.strip()
+
+    return result

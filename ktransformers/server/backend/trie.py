@@ -10,7 +10,7 @@ class Trie:
     def build(self, categories):
         for category in categories:
             self.insert(category)
-        logger.info(f"Trie build done: {self.nex}")
+        # logger.info(f"Trie build done: {self.nex}")
 
     def insert(self, category):
         words = str(category)
@@ -27,7 +27,7 @@ class Trie:
         self.category[p] = category
 
     def search_unique_category(self, prefix):
-        logger.info(f"Search unique category: {prefix}")
+        # logger.info(f"Search unique category:\n{prefix}\n")
         prefix = prefix.strip()
         if prefix[0] == '"':
             prefix = prefix[1:]

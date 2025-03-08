@@ -74,6 +74,7 @@ def _cache_prep(
     assert cache_dir is not None, "The cache_dir must be specified"
 
     data = load_data(data_path, fields)
+    # data = [data[0]]
 
     meta = {
         "fields": fields,
@@ -87,17 +88,15 @@ def _cache_prep(
     meta["system_length"] = system_cache[0][0].shape[2]
 
     def data_dumps_list(data: list[dict]):
-        data_entries = []
-        for i, entry in enumerate(data):
-            entry = json.dumps(entry, ensure_ascii=False)
-            data_entries.append(f"Data {i+1}: {entry}\n")
-        return data_entries
+        data_entries = json.dumps(data[0], ensure_ascii=False)
+        return [data_entries]
 
     # process data cache
     for start_idx in tqdm(range(0, len(data), stride)):
         data_entries_list = data_dumps_list(data[start_idx : start_idx + stride])
         token_ids = []
         for idx, entry in enumerate(data_entries_list):
+            # print(entry)
             entry_ids = tokenizer.encode(entry, add_special_tokens=False)
             meta["data_length"][start_idx + idx] = len(entry_ids)
             token_ids.extend(entry_ids)

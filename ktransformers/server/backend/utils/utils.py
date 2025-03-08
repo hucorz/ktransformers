@@ -12,11 +12,11 @@ def parse_user_format_fields(user_format: str):
     user_format = user_format.strip()
 
     # 确认最外层必须要是一个 list
-    assert user_format.lower().startswith("list["), "The user format must start with 'list['"
-    assert user_format.endswith("]"), "The user format must end with ']'"
+    # assert user_format.lower().startswith("list["), "The user format must start with 'list['"
+    # assert user_format.endswith("]"), "The user format must end with ']'"
 
     # 去掉最外层的 list, 解析出每个字段, key 是字段名，value 是字段类型
-    user_format = user_format[5:-1]
+    # user_format = user_format[5:-1]
     fields = {}
     # for field in user_format.split(","):
     #     field = field.strip()
@@ -27,7 +27,9 @@ def parse_user_format_fields(user_format: str):
     for match in matches:
         field_name = match.group(1).strip()
         field_type = match.group(2).strip()
-        logger.info(f"parse_user_format_fields field_name: {field_name}, field_type: {field_type}")
+        # logger.info(
+        #     f"parse_user_format_fields\nfield_name: {field_name}\nfield_type: {field_type}\n"
+        # )
         fields[field_name] = {"type": field_type}
 
         if field_type.startswith("Literal[") and field_type.endswith("]"):
@@ -45,11 +47,7 @@ def parse_user_format_fields(user_format: str):
 
 
 def data_dumps(data: list[dict]):
-    data_entries = ""
-    for i, entry in enumerate(data):
-        # print(entry)
-        entry = json.dumps(entry, ensure_ascii=False)
-        data_entries += f"Data {i+1}: {entry}\n"
+    data_entries = json.dumps(data[0], ensure_ascii=False)
     return data_entries
 
 

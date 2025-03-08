@@ -19,20 +19,21 @@ def is_bool_token(token, tokenizer):
     return text.strip().lower() in ["true", "false"], text
 
 
-def extend_input_ids(tokenizer, cur_generate_token, finish_fields_cnt, user_format, data_cnt):
+def extend_input_ids(
+    interface, tokenizer, cur_generate_tokens, finish_fields_cnt, user_format, data_cnt
+):
     format_keys = list(user_format.keys())
     fields_cnt = len(format_keys)
-    cur_data_idx = int(finish_fields_cnt // fields_cnt)
     cur_field_idx = int(finish_fields_cnt % fields_cnt)
     cur_field = format_keys[cur_field_idx]
-    last_token_id = cur_generate_token[-1]
+    last_token_id = cur_generate_tokens[-1]
 
+    cur_generate_str = tokenizer.decode(cur_generate_tokens)
     extend_str = ""
-    cur_generate_str = tokenizer.decode(cur_generate_token)
-    logger.info(f"cur_generate_str:{cur_generate_str}, cur_field: {user_format[cur_field]}")
+
     if user_format[cur_field]["type"] != "Literal":
         # not Literal type
-        if "\n" not in tokenizer.decode([last_token_id]):
+        if "\n" not in cur_generate_str:
             return False, None, None  # continue decode
     else:
         # Literal type or bool type
@@ -40,32 +41,24 @@ def extend_input_ids(tokenizer, cur_generate_token, finish_fields_cnt, user_form
         if not target_category:
             return False, None, None  # continue decode
 
-        logger.info(f"cur_generate_str:{cur_generate_str}, trie: {target_category}")
-        extend_str += target_category[len(cur_generate_str.strip()) :] + '"'
-        if cur_field_idx < fields_cnt - 1:
-            extend_str += ",\n"
-        else:
-            extend_str += "\n"
-
-    input_ids = torch.tensor(tokenizer.encode(extend_str)).unsqueeze(0)
+        extend_str += target_category[len(cur_generate_str) :] + "\n"
+        interface.profiler.inc("trie_hit")
 
     format_content = ""
     if cur_field_idx < fields_cnt - 1:
-        format_content = f'\t\t"{format_keys[cur_field_idx + 1]}":'
-    elif cur_data_idx < data_cnt - 1:
-        format_content = f'\t}},\n\t{{\n\t\t"{format_keys[0]}":'
+        format_content = f"[[## {format_keys[cur_field_idx + 1]} ##]]\n"
     else:
-        format_content = f"\t}}\n]\n[[## COMPLETE ##]]"
-    format_content_ids = tokenizer.encode(
-        format_content, return_tensors="pt", add_special_tokens=False
-    )
-    input_ids = torch.cat([input_ids, format_content_ids], dim=1)
+        format_content = f"[[## COMPLETE ##]]"
+
     extend_str += format_content
+    extend_ids = tokenizer.encode(extend_str, add_special_tokens=False)
+    input_ids = torch.tensor([last_token_id] + extend_ids).unsqueeze(0)
 
-    return True, input_ids, extend_str
+    return True, input_ids, cur_generate_str + extend_str
 
 
-def _generate_turbo(
+def _generate(
+    interface,
     model,
     tokenizer,
     input_ids: torch.Tensor,
@@ -82,7 +75,10 @@ def _generate_turbo(
     past_key_values = DynamicCache.from_legacy_cache(kv_cache)
 
     with torch.inference_mode():
-        for _ in range(max_new_tokens):
+        for idx in range(max_new_tokens):
+            if idx == 0:
+                interface.profiler.start_timer("prefill")
+            # logger.info(f"\ncur response:\n{''.join(response)}")
             outputs = model(input_ids, past_key_values=past_key_values, use_cache=True)
             logits = outputs.logits
             next_token_id = int(torch.argmax(logits[:, -1, :], dim=-1))
@@ -91,11 +87,12 @@ def _generate_turbo(
             if use_turbo:
                 cur_generate_token.append(next_token_id)
                 field_finish, input_ids, generate_str = extend_input_ids(
-                    tokenizer, cur_generate_token, len(response), user_format, data_cnt
+                    interface, tokenizer, cur_generate_token, len(response), user_format, data_cnt
                 )
                 if not field_finish:
                     input_ids = torch.tensor([next_token_id]).unsqueeze(0)
                 else:
+                    cur_generate_token = []
                     response.append(generate_str)
             else:
                 input_ids = torch.tensor([next_token_id]).unsqueeze(0)
@@ -103,10 +100,14 @@ def _generate_turbo(
                 #     print(repr(tokenizer.decode(next_token_id)))
                 response.append(tokenizer.decode(next_token_id))
             past_key_values = DynamicCache.from_legacy_cache(outputs.past_key_values)
+            interface.profiler.inc("decode")
+            if idx == 0:
+                interface.profiler.pause_timer("prefill")
     return "".join(response)
 
 
 def generate_turbo(
+    interface,
     model,
     tokenizer,
     input_str: str,
@@ -123,9 +124,9 @@ def generate_turbo(
         the input_str need to contain the data info, like:
         ==================
         [[## DATA ##]]
-        {data_entries}
+        {data_entry}
         [[## QUERY ##]]
-        "{query}"
+        {query}
         [[## FORMAT ##]]
         {output_format}
         ==================
@@ -133,13 +134,14 @@ def generate_turbo(
         the input_str is like:
         ==================
         [[## QUERY ##]]
-        "{query}"
+        {query}
         [[## FORMAT ##]]
         {output_format}
         ==================
 
     """
     user_format = parse_user_format_fields(user_format)
+    # print(user_format)
 
     for k, v in user_format.items():
         if v["type"] == "Literal":
@@ -151,10 +153,12 @@ def generate_turbo(
 
     if add_generation_prompt:
         input_str += f"<|im_end|>\n<|im_start|>assistant\n"
-    pre_extend_text = f'[[## RESULT ##]]\n[\n\t{{\n\t\t"{list(user_format.keys())[0]}":'
+    pre_extend_text = f"[[## {list(user_format.keys())[0]} ##]]\n"
     input_str += pre_extend_text
+    # print(f"input_str:\n{input_str}")
     inputs = tokenizer(input_str, return_tensors="pt").to(model.device)
-    return pre_extend_text + _generate_turbo(
+    return pre_extend_text + _generate(
+        interface,
         model,
         tokenizer,
         inputs["input_ids"],
@@ -162,17 +166,22 @@ def generate_turbo(
         user_format,
         data_cnt=data_cnt,
         max_new_tokens=max_new_tokens,
+        use_turbo=True,
     )
 
 
 def response_normal(
-    model, tokenizer, data: list[dict], query: str, user_format: str, max_new_tokens: int = 200
+    interface,
+    model,
+    tokenizer,
+    data: list[dict],
+    query: str,
+    user_format: str,
+    max_new_tokens: int = 200,
 ):
-    data_entries = data_dumps(data)
+    data_entry = data_dumps(data)
 
-    user_prompt = USER_PROMPT.format(
-        data_entries=data_entries, data_length=len(data), query=query, output_format=user_format
-    )
+    user_prompt = USER_PROMPT.format(data_entry=data_entry, query=query, output_format=user_format)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -180,35 +189,55 @@ def response_normal(
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            do_sample=False,
-            max_new_tokens=max_new_tokens,
-            top_p=None,
-            top_k=None,
-            temperature=None,
-        )
-    input_length = inputs["input_ids"].shape[-1]
-    generated_tokens = outputs[:, input_length:]
-    return tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+
+    return _generate(
+        interface,
+        model,
+        tokenizer,
+        inputs["input_ids"],
+        None,
+        user_format,
+        data_cnt=len(data),
+        max_new_tokens=max_new_tokens,
+        use_turbo=False,
+    )
+
+    # use model.generate, which is unable to monitor the decoding times
+    # with torch.inference_mode():
+    #     outputs = model.generate(
+    #         **inputs,
+    #         do_sample=False,
+    #         max_new_tokens=max_new_tokens,
+    #         top_p=None,
+    #         top_k=None,
+    #         temperature=None,
+    #     )
+    # input_length = inputs["input_ids"].shape[-1]
+    # generated_tokens = outputs[:, input_length:]
+    # return tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
 
 
 def response_turbo_without_cache(
-    model, tokenizer, data: list[dict], query: str, user_format: str, max_new_tokens: int = 200
+    interface,
+    model,
+    tokenizer,
+    data: list[dict],
+    query: str,
+    user_format: str,
+    max_new_tokens: int = 200,
 ):
-    data_entries = data_dumps(data)
+    data_entry = data_dumps(data)
 
-    user_prompt = USER_PROMPT.format(
-        data_entries=data_entries, data_length=len(data), query=query, output_format=user_format
-    )
+    user_prompt = USER_PROMPT.format(data_entry=data_entry, query=query, output_format=user_format)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
     input_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # logger.info(f"Input str:\n{input_str}\n")
     return generate_turbo(
+        interface,
         model,
         tokenizer,
         input_str,
@@ -220,6 +249,7 @@ def response_turbo_without_cache(
 
 
 def response_turbo_with_system_cache(
+    interface,
     model,
     tokenizer,
     data: list[dict],
@@ -236,13 +266,14 @@ def response_turbo_with_system_cache(
     <|im_start|>user
     [[## DATA ##]]
     """
-    data_entries = data_dumps(data)
+    data_entry = data_dumps(data)
 
     input_str = USER_PROMPT_SUFFIX_WITH_DATA.format(
-        data_entries=data_entries, data_length=len(data), query=query, output_format=user_format
+        data_entry=data_entry, query=query, output_format=user_format
     )
     input_str += f"<|im_end|>\n<|im_start|>assistant\n"
     return generate_turbo(
+        interface,
         model,
         tokenizer,
         input_str,
@@ -254,6 +285,7 @@ def response_turbo_with_system_cache(
 
 
 def response_turbo_with_all_cache(
+    interface,
     model,
     tokenizer,
     query: str,
@@ -274,12 +306,11 @@ def response_turbo_with_all_cache(
     ...
     """
 
-    user_prompt = USER_PROMPT_SUFFIX.format(
-        data_length=data_cnt, query=query, output_format=user_format
-    )
+    user_prompt = USER_PROMPT_SUFFIX.format(query=query, output_format=user_format)
 
     input_str = "\n" + user_prompt + f"<|im_end|>\n<|im_start|>assistant\n"
     return generate_turbo(
+        interface,
         model,
         tokenizer,
         input_str,

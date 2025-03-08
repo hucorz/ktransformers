@@ -384,8 +384,12 @@ class TransformersInterface(BackendInterfaceBase):
         self.cache_meta_path = os.path.join(self.cache_dir, f"meta.json")
         # each model has its own cache dir
         self.cache_dir = os.path.join(self.cache_dir, self.model_name)
-        with open(self.cache_meta_path, "r") as f:
-            self.meta = json.load(f)
+
+        if not os.path.exists(self.cache_meta_path):
+            self.meta = {"cache": {}}
+        else:
+            with open(self.cache_meta_path, "r") as f:
+                self.meta = json.load(f)
 
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -441,18 +445,25 @@ class TransformersInterface(BackendInterfaceBase):
         use_cache: bool = False,
         is_full_data: bool = False,
     ):
+        assert stride == 1, "stride should be 1"
         data = load_data(data_path, self.meta["cache"][self.model_name][data_path]["fields"])
         data = [data[i] for i in data_ids]
 
         data_length = len(data_ids)
         response = []
 
+        self.profiler.create_and_start_timer("data_query")
+        self.profiler.create_timer("prefill")
+        self.profiler.set_counter("decode", 0)
+        self.profiler.set_counter("trie_hit", 0)
         if not use_turbo:
             logger.info("Using response_normal")
             for st in tqdm(range(0, data_length, stride)):
                 ed = min(st + stride, data_length)
                 data_slice = data[st:ed]
-                res = response_normal(self.model, self.tokenizer, data_slice, query, user_format)
+                res = response_normal(
+                    self, self.model, self.tokenizer, data_slice, query, user_format
+                )
                 # print(res)
                 response.append(res)
         elif not use_cache:
@@ -461,9 +472,9 @@ class TransformersInterface(BackendInterfaceBase):
                 ed = min(st + stride, data_length)
                 data_slice = data[st:ed]
                 res = response_turbo_without_cache(
-                    self.model, self.tokenizer, data_slice, query, user_format
+                    self, self.model, self.tokenizer, data_slice, query, user_format
                 )
-                print(res)
+                # print(res)
                 response.append(res)
         elif not is_full_data:
             logger.info("Using response_turbo_with_system_cache")
@@ -472,6 +483,7 @@ class TransformersInterface(BackendInterfaceBase):
                 data_slice = data[st:ed]
                 response.append(
                     response_turbo_with_system_cache(
+                        self,
                         self.model,
                         self.tokenizer,
                         data_slice,
@@ -492,6 +504,7 @@ class TransformersInterface(BackendInterfaceBase):
                 data_cache = torch.load(data_cache_path, weights_only=True)
                 response.append(
                     response_turbo_with_all_cache(
+                        self,
                         self.model,
                         self.tokenizer,
                         query,
@@ -501,4 +514,6 @@ class TransformersInterface(BackendInterfaceBase):
                         data_cnt=len(data_slice),
                     )
                 )
+        self.profiler.pause_timer("data_query")
+        self.report_last_time_performance()
         return response
